@@ -7,6 +7,7 @@ from __future__ import annotations
 import os
 import hashlib
 import secrets
+from urllib.parse import quote
 import uuid
 from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
@@ -18,13 +19,13 @@ from typing import Annotated, Literal
 import jwt
 from argon2 import PasswordHasher
 from argon2.exceptions import VerifyMismatchError, VerificationError
-from fastapi import Depends, FastAPI, HTTPException, UploadFile, File, Request
-from fastapi.responses import HTMLResponse
+from fastapi import Depends, FastAPI, HTTPException, UploadFile, File, Form, Request
+from fastapi.responses import HTMLResponse, Response
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
 from sqlalchemy import (
     JSON, Boolean, CheckConstraint, Column, Date, DateTime, Float, ForeignKey,
-    Integer, String, Text, UniqueConstraint, create_engine, func, select,
+    Integer, String, Text, LargeBinary, UniqueConstraint, create_engine, func, select,
 )
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
@@ -323,6 +324,39 @@ class ContentLock(Base):
     __table_args__ = (UniqueConstraint('entity_type','entity_id'),)
 
 
+
+
+# Separate tables: safe migration for an existing PostgreSQL database.
+# SQLAlchemy create_all adds these tables without changing/deleting old KPI tables.
+class TaskProgressEntry(Base):
+    __tablename__ = 'task_progress_entries'
+    id = Column(String(36), primary_key=True, default=uid)
+    assignment_id = Column(String(36), ForeignKey('task_assignments.id'), nullable=False, index=True)
+    author_id = Column(String(36), ForeignKey('employees.id'), nullable=False)
+    progress_percent = Column(Integer, nullable=False)
+    note = Column(Text, default='', nullable=False)
+    created_at = Column(DateTime(timezone=True), default=now, nullable=False)
+    __table_args__ = (CheckConstraint('progress_percent BETWEEN 0 AND 100'),)
+
+
+class TaskProgressFile(Base):
+    __tablename__ = 'task_progress_files'
+    id = Column(String(36), primary_key=True, default=uid)
+    progress_entry_id = Column(String(36), ForeignKey('task_progress_entries.id'), nullable=False, index=True)
+    file_name = Column(String(250), nullable=False)
+    mime_type = Column(String(120), nullable=False)
+    size_bytes = Column(Integer, nullable=False)
+    file_data = Column(LargeBinary, nullable=False)
+
+
+class TaskDeletion(Base):
+    __tablename__ = 'task_deletions'
+    task_id = Column(String(36), ForeignKey('tasks.id'), primary_key=True)
+    deleted_by = Column(String(36), ForeignKey('employees.id'), nullable=False)
+    deleted_at = Column(DateTime(timezone=True), default=now, nullable=False)
+    reason = Column(Text, nullable=False)
+
+
 Base.metadata.create_all(engine)
 with SessionLocal() as s:
     if not s.get(Setting, 'annual_min_months'):
@@ -332,6 +366,37 @@ with SessionLocal() as s:
     # CESD_ADMIN_EMAIL / CESD_ADMIN_PASSWORD: chỉ tạo tài khoản khi chưa có quản trị.
     # KHÔNG tự ghi đè mật khẩu mỗi lần Render khởi động, vì người dùng có thể đã đổi
     # mật khẩu trong ứng dụng. Khôi phục một lần bằng CESD_ADMIN_RESET_ID (xem dưới).
+    # Official CESD structure and independent professional positions.
+    # Existing codes are untouched; no employee's job title is altered.
+    default_departments = [
+        ('TCD', 'Tổ Công nghệ số và Dự báo Môi trường'),
+        ('TKH', 'Tổ Khoa học và Công nghệ Môi trường'),
+        ('TST', 'Tổ Sinh thái và Phát triển bền vững'),
+        ('PTN', 'Phòng Thí nghiệm và Quan trắc Môi trường'),
+    ]
+    existing_department_codes = set(s.scalars(select(Department.code)).all())
+    for code, name in default_departments:
+        if code not in existing_department_codes:
+            s.add(Department(code=code, name=name))
+    default_positions = [
+        ('PGD', 'Phó Giám đốc'),
+        ('TRUONG_TO', 'Tổ trưởng chuyên môn'),
+        ('PHO_TO', 'Tổ phó chuyên môn'),
+        ('TRUONG_PTN', 'Trưởng phòng Thí nghiệm'),
+        ('PHO_PTN', 'Phó Trưởng phòng Thí nghiệm'),
+        ('NCVC', 'Nghiên cứu viên cao cấp'),
+        ('NCVC_CHINH', 'Nghiên cứu viên chính'),
+        ('NCV', 'Nghiên cứu viên'),
+        ('KS', 'Kỹ sư'),
+        ('KTV', 'Kỹ thuật viên'),
+        ('CV', 'Chuyên viên'),
+        ('NV', 'Nhân viên'),
+    ]
+    existing_position_codes = set(s.scalars(select(Position.code)).all())
+    for code, name in default_positions:
+        if code not in existing_position_codes:
+            s.add(Position(code=code, name=name))
+
     admin_email = os.getenv('CESD_ADMIN_EMAIL', '').strip().lower()
     admin_pw = os.getenv('CESD_ADMIN_PASSWORD', '')
     reset_id = os.getenv('CESD_ADMIN_RESET_ID', '').strip()
@@ -428,9 +493,15 @@ def current_user(credentials: Annotated[HTTPAuthorizationCredentials, Depends(se
 User = Annotated[Employee, Depends(current_user)]
 
 
+def is_task_deleted(db, task_id):
+    return db.get(TaskDeletion, task_id) is not None
+
+
 def by_id(db, cls, item_id):
     obj = db.get(cls, item_id)
     require(obj is not None, 'Không tìm thấy dữ liệu', 404)
+    if cls is Task:
+        require(not is_task_deleted(db, item_id), 'Nhiệm vụ đã chuyển vào thùng rác', 404)
     return obj
 
 
@@ -445,6 +516,8 @@ def manages_employee(db, user, emp_id):
 
 def can_manage(db, user, emp_id): return is_admin(user) or manages_employee(db, user, emp_id)
 def can_view_task(db, user, task):
+    if task is None or is_task_deleted(db, task.id):
+        return False
     return (is_admin(user) or task.assigner_id == user.id or is_manager(db, user, task.department_id)
             or db.scalar(select(Assignment.id).where(Assignment.task_id == task.id, Assignment.employee_id == user.id)) is not None)
 
@@ -615,6 +688,13 @@ def list_tasks(db: DB, user: User):
             r['assignments'] = [serialize(a) for a in db.scalars(select(Assignment).where(Assignment.task_id==t.id)).all()]
             for a in r['assignments']:
                 a['effective_status'] = 'overdue' if t.due_date < today_vn() and a['status'] in ('not_started','in_progress','needs_revision') else a['status']
+                if a['status'] == 'declined':
+                    last_decline = db.scalar(select(ApprovalLog).where(
+                        ApprovalLog.entity_type == 'task_assignment',
+                        ApprovalLog.entity_id == a['id'],
+                        ApprovalLog.action == 'decline',
+                    ).order_by(ApprovalLog.created_at.desc()))
+                    a['decline_reason'] = last_decline.comment if last_decline else ''
             result.append(r)
     return result
 
@@ -623,16 +703,31 @@ class ProgressIn(BaseModel):
     progress_percent: int = Field(ge=0, le=100)
     result_text: str = ''
 
+def record_progress(db, assignment, actor, percent, note):
+    by_id(db, Task, assignment.task_id)
+    require(assignment.employee_id == actor.id, 'Chỉ người được giao mới cập nhật', 403)
+    require(assignment.status in ('not_started','in_progress','needs_revision'),
+            'Nhiệm vụ đã từ chối hoặc đang chờ/đã nghiệm thu', 409)
+    old = assignment.status
+    assignment.progress_percent = percent
+    assignment.result_text = note
+    if old != 'needs_revision' and percent > 0:
+        assignment.status = 'in_progress'
+    entry = TaskProgressEntry(assignment_id=assignment.id, author_id=actor.id,
+                              progress_percent=percent, note=note)
+    db.add(entry)
+    db.flush()
+    transition(db,actor,'task_assignment',assignment.id,'update_progress',old,
+               assignment.status,f'{percent}%: {note[:200]}')
+    return entry
+
+
 @app.post('/assignments/{aid}/progress')
 def update_progress(aid: str, body: ProgressIn, db: DB, user: User):
     a = by_id(db,Assignment,aid)
-    require(a.employee_id == user.id)
-    require(a.status not in ('pending_acceptance','completed','approved'), 'Nhiệm vụ đang chờ/đã nghiệm thu')
-    old = a.status
-    a.progress_percent, a.result_text = body.progress_percent,body.result_text
-    if a.status != 'needs_revision' and body.progress_percent > 0: a.status = 'in_progress'
-    transition(db,user,'task_assignment',aid,'update_progress',old,a.status,str(body.progress_percent)+'%')
-    db.commit(); return {'status':a.status}
+    entry = record_progress(db,a,user,body.progress_percent,body.result_text)
+    db.commit()
+    return {'status': a.status, 'progress_entry_id': entry.id}
 
 
 class ReportIn(BaseModel):
@@ -641,6 +736,7 @@ class ReportIn(BaseModel):
 @app.post('/assignments/{aid}/request-acceptance')
 def request_acceptance(aid: str, body: ReportIn, db: DB, user: User):
     a = by_id(db,Assignment,aid)
+    by_id(db, Task, a.task_id)  # Không cho nộp nghiệm thu nhiệm vụ đã xóa
     require(a.employee_id == user.id)
     require(a.status in ('not_started','in_progress','needs_revision'), 'Trạng thái không cho phép nghiệm thu')
     old=a.status; a.status='pending_acceptance'; a.report_text=body.report_text; a.submitted_at=now()
@@ -781,12 +877,13 @@ def refresh_auto(db, k):
     numerator=denominator=0.
     for aid,e in latest.items():
         a=db.get(Assignment,aid); t=db.get(Task,a.task_id)
+        if t is None or is_task_deleted(db,t.id) or a.status=='declined': continue
         numerator+=e.completion_percent*t.kpi_weight; denominator+=t.kpi_weight
         if e.monthly_kpi_id is None: e.monthly_kpi_id=k.id
     due=[]
     for a in db.scalars(select(Assignment).where(Assignment.employee_id==k.employee_id)):
         t=db.get(Task,a.task_id)
-        if not t.is_cancelled and month_start <= t.due_date < month_end: due.append(a)
+        if not is_task_deleted(db,t.id) and not t.is_cancelled and a.status!='declined' and month_start <= t.due_date < month_end: due.append(a)
     ratio=sum(a.status in ('completed','approved') for a in due)/len(due) if due else None
     for d in db.scalars(select(KPIDetail).where(KPIDetail.kpi_id==k.id)):
         if d.method=='task_auto': d.auto_score=round(numerator/denominator/100*d.scale_max,2) if denominator else None
@@ -1054,7 +1151,13 @@ from fastapi.responses import RedirectResponse
 
 @app.get('/', response_class=HTMLResponse, include_in_schema=False)
 def homepage():
-    return Path(__file__).with_name('index.html').read_text(encoding='utf-8')
+    html = Path(__file__).with_name('index.html').read_text(encoding='utf-8')
+    shortcut = ("<a href='/cesd-workflow' style='position:fixed;bottom:24px;right:24px;"
+                "background:#123b66;color:white;z-index:999999;padding:12px 16px;"
+                "border-radius:12px;text-decoration:none;font:600 14px Arial;"
+                "box-shadow:0 4px 14px #0003'>Công việc nâng cao / Báo cáo</a>")
+    return HTMLResponse(html.replace('</body>', shortcut + '</body>')
+                        if '</body>' in html else html + shortcut)
 
 @app.get('/auth/me')
 def auth_me(user: User):
@@ -1181,3 +1284,211 @@ def edit_task(tid: str, body: TaskEditIn, db: DB, user: User):
     audit(db,user,'tasks',tid,'edit',fields=list(changed))
     db.commit()
     return serialize(t)
+
+
+# CESD WORKFLOW ENHANCEMENTS -----------------------------------------------
+# Existing endpoints remain available to the original index.html.
+MAX_PROGRESS_FILE_BYTES = 5 * 1024 * 1024
+ALLOWED_PROGRESS_EXTENSIONS = {
+    '.pdf', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx',
+    '.txt', '.csv', '.png', '.jpg', '.jpeg', '.odt', '.ods',
+}
+
+
+class DeclineAssignmentIn(BaseModel):
+    reason: str = Field(min_length=5, max_length=2000)
+
+
+@app.post('/assignments/{aid}/decline')
+def decline_assignment(aid: str, body: DeclineAssignmentIn, db: DB, user: User):
+    assignment = by_id(db, Assignment, aid)
+    task = by_id(db, Task, assignment.task_id)
+    require(user.id == assignment.employee_id, 'Chỉ nhân sự được giao có thể từ chối', 403)
+    require(assignment.status in ('not_started', 'in_progress', 'needs_revision'),
+            'Nhiệm vụ không còn ở trạng thái có thể từ chối', 409)
+    require(not task.is_cancelled, 'Nhiệm vụ đã hủy', 409)
+    old = assignment.status
+    assignment.status = 'declined'
+    transition(db, user, 'task_assignment', aid, 'decline', old, 'declined', body.reason.strip())
+    db.commit()
+    return {'status': assignment.status, 'reason': body.reason.strip()}
+
+
+class ReopenAssignmentIn(BaseModel):
+    reason: str = Field(min_length=5, max_length=2000)
+
+
+@app.post('/assignments/{aid}/reopen')
+def reopen_declined_assignment(aid: str, body: ReopenAssignmentIn, db: DB, user: User):
+    assignment = by_id(db, Assignment, aid)
+    task = by_id(db, Task, assignment.task_id)
+    require(is_admin(user) or task.assigner_id == user.id or is_manager(db, user, task.department_id),
+            'Không có quyền xử lý nhiệm vụ bị từ chối', 403)
+    require(assignment.status == 'declined', 'Chỉ mở lại nhiệm vụ đã bị từ chối', 409)
+    assignment.status = 'not_started'
+    assignment.progress_percent = 0
+    transition(db, user, 'task_assignment', aid, 'reopen', 'declined', 'not_started', body.reason.strip())
+    db.commit()
+    return {'status': assignment.status}
+
+
+class ReassignDeclinedIn(BaseModel):
+    declined_assignment_id: str
+    new_employee_id: str
+    reason: str = Field(min_length=5, max_length=2000)
+
+
+@app.post('/tasks/{tid}/reassign')
+def reassign_declined_task(tid: str, body: ReassignDeclinedIn, db: DB, user: User):
+    task = by_id(db, Task, tid)
+    require(is_admin(user) or task.assigner_id == user.id or is_manager(db, user, task.department_id),
+            'Không có quyền giao lại nhiệm vụ', 403)
+    require(not task.is_cancelled, 'Nhiệm vụ đã hủy', 409)
+    old_assignment = by_id(db, Assignment, body.declined_assignment_id)
+    require(old_assignment.task_id == tid and old_assignment.status == 'declined',
+            'Phải chọn phân công đã từ chối thuộc nhiệm vụ này', 409)
+    target = by_id(db, Employee, body.new_employee_id)
+    require(target.status == 'active', 'Nhân sự nhận việc phải đang hoạt động', 409)
+    require(is_admin(user) or can_manage(db, user, target.id), 'Không được phân công nhân sự này', 403)
+    require(target.id != old_assignment.employee_id,
+            'Để giao lại cùng người, dùng chức năng Mở lại', 409)
+    assigned = db.scalar(select(Assignment).where(
+        Assignment.task_id == tid, Assignment.employee_id == target.id))
+    if assigned:
+        require(assigned.status == 'declined',
+                'Nhân sự này đã được phân công trong nhiệm vụ', 409)
+        assigned.status = 'not_started'
+        assigned.progress_percent = 0
+        assigned.role_type = old_assignment.role_type
+    else:
+        assigned = Assignment(task_id=tid, employee_id=target.id,
+                              role_type=old_assignment.role_type, status='not_started')
+        db.add(assigned)
+        db.flush()
+    transition(db, user, 'task_assignment', old_assignment.id, 'reassign',
+               'declined', 'declined', f'{body.reason.strip()} | assigned_to={target.id}')
+    transition(db, user, 'task_assignment', assigned.id, 'new_assignment', None,
+               'not_started', body.reason.strip())
+    db.commit()
+    return {'ok': True, 'new_assignment_id': assigned.id}
+
+
+@app.get('/assignments/{aid}/progress-history')
+def assignment_progress_history(aid: str, db: DB, user: User):
+    assignment = by_id(db, Assignment, aid)
+    task = by_id(db, Task, assignment.task_id)
+    require(can_view_task(db, user, task), 'Không được xem lịch sử công việc', 403)
+    entries = db.scalars(select(TaskProgressEntry).where(
+        TaskProgressEntry.assignment_id == aid).order_by(TaskProgressEntry.created_at.asc(),
+                                                         TaskProgressEntry.id.asc())).all()
+    result = []
+    for entry in entries:
+        row = serialize(entry)
+        author = db.get(Employee, entry.author_id)
+        row['author_name'] = author.full_name if author else ''
+        files = db.scalars(select(TaskProgressFile).where(
+            TaskProgressFile.progress_entry_id == entry.id)).all()
+        row['files'] = [{'id': f.id, 'file_name': f.file_name,
+                         'size_bytes': f.size_bytes} for f in files]
+        result.append(row)
+    return result
+
+
+@app.post('/assignments/{aid}/progress-reports')
+async def submit_progress_report(
+    aid: str,
+    db: DB,
+    user: User,
+    progress_percent: int = Form(..., ge=0, le=100),
+    note: str = Form('', max_length=10000),
+    file: UploadFile | None = File(None),
+):
+    assignment = by_id(db, Assignment, aid)
+    file_name, file_bytes, content_type = None, None, None
+    if file is not None and file.filename:
+        file_name = Path(file.filename.replace('\\', '/')).name[:250]
+        require(bool(file_name) and Path(file_name).suffix.lower() in ALLOWED_PROGRESS_EXTENSIONS,
+                'Chỉ chấp nhận PDF, Office, văn bản hoặc ảnh (không nhận file thực thi)', 400)
+        file_bytes = await file.read(MAX_PROGRESS_FILE_BYTES + 1)
+        require(0 < len(file_bytes) <= MAX_PROGRESS_FILE_BYTES,
+                'File báo cáo phải từ 1 byte đến 5 MB', 413)
+        content_type = (file.content_type or 'application/octet-stream')[:120]
+    require(bool(note.strip()) or file_bytes is not None,
+            'Cần nhập nội dung cập nhật hoặc đính kèm báo cáo', 400)
+    entry = record_progress(db, assignment, user, progress_percent, note.strip())
+    if file_bytes is not None:
+        db.add(TaskProgressFile(progress_entry_id=entry.id, file_name=file_name,
+                                mime_type=content_type, size_bytes=len(file_bytes),
+                                file_data=file_bytes))
+    db.commit()
+    return {'status': assignment.status, 'progress_entry_id': entry.id,
+            'progress_percent': entry.progress_percent, 'file_uploaded': file_bytes is not None}
+
+
+@app.get('/progress-files/{file_id}')
+def download_progress_file(file_id: str, db: DB, user: User):
+    doc = by_id(db, TaskProgressFile, file_id)
+    entry = by_id(db, TaskProgressEntry, doc.progress_entry_id)
+    assignment = by_id(db, Assignment, entry.assignment_id)
+    task = by_id(db, Task, assignment.task_id)
+    require(can_view_task(db, user, task), 'Không được tải file báo cáo', 403)
+    # Header uses RFC 5987 encoding, protecting non-ASCII Vietnamese filenames.
+    return Response(content=doc.file_data,
+                    media_type='application/octet-stream',
+                    headers={
+                        'Content-Disposition': "attachment; filename*=UTF-8''" + quote(doc.file_name),
+                        'X-Content-Type-Options': 'nosniff',
+                        'Cache-Control': 'private, no-store',
+                    })
+
+
+class DeleteAssignedTaskIn(BaseModel):
+    reason: str = Field(min_length=5, max_length=2000)
+
+
+@app.delete('/tasks/{tid}')
+def delete_assigned_task(tid: str, body: DeleteAssignedTaskIn, db: DB, user: User):
+    task = by_id(db, Task, tid)
+    require(is_admin(user) or task.assigner_id == user.id,
+            'Chỉ quản trị hoặc người giao việc được xóa', 403)
+    approved = db.scalar(select(Evaluation.id).join(
+        Assignment, Evaluation.assignment_id == Assignment.id).where(
+            Assignment.task_id == tid, Evaluation.decision == 'approved'))
+    require(not approved or is_owner(user),
+            'Nhiệm vụ đã duyệt cuối: chỉ chủ hệ thống được đưa vào thùng rác', 403)
+    db.add(TaskDeletion(task_id=tid, deleted_by=user.id, reason=body.reason.strip()))
+    transition(db, user, 'task', tid, 'soft_delete', 'active', 'deleted', body.reason.strip())
+    db.commit()
+    return {'ok': True, 'deleted': True, 'message': 'Đã chuyển nhiệm vụ vào thùng rác'}
+
+
+@app.get('/tasks/deleted')
+def list_deleted_tasks(db: DB, user: User):
+    require(is_admin(user), 'Chỉ quản trị được xem thùng rác', 403)
+    rows = db.scalars(select(TaskDeletion).order_by(TaskDeletion.deleted_at.desc())).all()
+    result = []
+    for deleted in rows:
+        task = db.get(Task, deleted.task_id)
+        if task:
+            result.append({'id': task.id, 'code': task.code, 'title': task.title,
+                           'deleted_at': deleted.deleted_at.isoformat() if deleted.deleted_at else '',
+                           'reason': deleted.reason, 'deleted_by': deleted.deleted_by})
+    return result
+
+
+@app.post('/tasks/{tid}/restore')
+def restore_deleted_task(tid: str, db: DB, user: User):
+    require(is_admin(user), 'Chỉ quản trị được khôi phục', 403)
+    deleted = db.get(TaskDeletion, tid)
+    require(deleted is not None, 'Nhiệm vụ không nằm trong thùng rác', 404)
+    db.delete(deleted)
+    transition(db, user, 'task', tid, 'restore', 'deleted', 'active', 'Khôi phục nhiệm vụ')
+    db.commit()
+    return {'ok': True, 'restored': True}
+
+
+WORKFLOW_PAGE = '<!doctype html>\n<html lang="vi"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">\n<title>CESD · Quản lý nhiệm vụ nâng cao</title>\n<style>\n:root{font-family:Arial,"Segoe UI",sans-serif;color:#17304f;background:#f3f6fb}*{box-sizing:border-box}body{margin:0}header{background:#12375f;color:white;padding:19px 5%;display:flex;justify-content:space-between;gap:15px;align-items:center;flex-wrap:wrap}header strong{font-size:21px}header a{color:#dceaff;text-decoration:none}main{max-width:1180px;margin:25px auto;padding:0 18px}.card{background:white;border:1px solid #d8e2ed;border-radius:13px;padding:20px;margin-bottom:16px;box-shadow:0 2px 7px #08274608}h1{font-size:23px}h2{font-size:19px;margin:0 0 14px}h3{margin:12px 0 8px;font-size:16px}p{line-height:1.5}small,.muted{color:#56708d}.notice{padding:12px 15px;background:#e9f1fd;border-radius:8px;margin:12px 0;color:#164c86}.err{background:#fff1f1;color:#a32222}.ok{background:#e9f8ef;color:#206137}label{display:block;margin:9px 0 5px;font-weight:600;font-size:14px}input,select,textarea{font:inherit;border:1px solid #c8d4e5;border-radius:7px;padding:10px;width:100%;background:white;color:#153452}textarea{min-height:68px;resize:vertical}button,.btn{border:0;border-radius:8px;background:#1861a7;color:white;padding:11px 15px;font-weight:600;cursor:pointer;font-size:14px}button:hover{background:#134d85}button:disabled{opacity:.55;cursor:not-allowed}.mutebtn{background:#e5eef9;color:#173d65}.mutebtn:hover{background:#d3e3f6}.danger{background:#a53a3a}.danger:hover{background:#812e2e}.warning{background:#9a6116}.warning:hover{background:#775010}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(205px,1fr));gap:13px}.line{display:flex;gap:10px;align-items:center;flex-wrap:wrap}.pill{display:inline-block;padding:5px 9px;border-radius:30px;background:#e4ecf4;font-size:12px;color:#1b436f}.task{border-top:1px solid #dce5f0;padding:17px 0}.task:first-child{border:0}nav{display:flex;gap:9px;flex-wrap:wrap;margin:18px 0}nav button{background:#dfe8f4;color:#143b65}nav button.active{background:#17548b;color:white}.assignee{border:1px solid #e0e8f0;padding:14px;border-radius:10px;margin-top:10px;background:#fafcff}.entry{padding:10px;border-left:3px solid #2775ae;background:#f3f7fc;margin:9px 0}.entry p{margin:6px 0;white-space:pre-wrap}.hidden{display:none!important}.inlineform{display:flex;gap:10px;align-items:center;flex-wrap:wrap}.inlineform>*{flex:1}.inlineform button{flex:0 0 auto}.login{max-width:490px;margin:65px auto}.status{font-size:13px;color:#436181}.actions{display:flex;gap:9px;flex-wrap:wrap;margin-top:10px}.fieldnote{font-size:12px;color:#667b93;margin-top:5px}.section-title{margin-top:20px;border-bottom:1px solid #dce5ed;padding-bottom:10px}details summary{cursor:pointer;font-weight:600;color:#215c9a}footer{text-align:center;padding:28px;color:#607995;font-size:13px}@media(max-width:650px){header{padding:15px}main{padding:0 10px}.card{padding:14px}}\n</style></head><body>\n<header><strong>CESD · Quản lý công việc & KPI</strong><span><a href="/">← Trang KPI chính</a> &nbsp; <span id="who"></span> <button class="mutebtn hidden" id="logout" onclick="logout()">Đăng xuất</button></span></header>\n<main>\n<section class="card login" id="loginPanel"><h1>Đăng nhập quản lý nhiệm vụ</h1><p class="muted">Dùng tài khoản CESD KPI Online hiện có. Trang này bổ sung các chức năng mới, không thay đổi dữ liệu ở trang chính.</p>\n<form id="loginForm"><label>Email</label><input name="email" type="email" required autocomplete="username"><label>Mật khẩu</label><input name="password" type="password" required autocomplete="current-password"><div style="margin-top:16px"><button type="submit">Đăng nhập</button></div></form></section>\n<section id="appPanel" class="hidden"><div class="notice">Lịch sử tiến độ và file báo cáo được lưu theo từng lần cập nhật. Xóa nhiệm vụ là chuyển vào thùng rác, không xóa vĩnh viễn.</div>\n<nav><button id="tab-tasks" onclick="showTab(\'tasks\')">Công việc & tiến độ</button><button id="tab-positions" onclick="showTab(\'positions\')">Chức danh / Nhân sự</button><button id="tab-trash" onclick="showTab(\'trash\')">Thùng rác</button><button class="mutebtn" onclick="refreshAll()">↻ Làm mới</button></nav>\n<section id="view-tasks" class="card"><h2>Công việc đang thực hiện</h2><p class="muted">Nhân viên được cập nhật nhiều lần, nộp file và từ chối nhiệm vụ kèm lý do. Người giao việc/quản lý có thể xử lý nhiệm vụ bị từ chối.</p><div id="tasksArea">Đang tải dữ liệu...</div></section>\n<section id="view-positions" class="card hidden"><h2>Cơ cấu tổ chức và chức danh CESD</h2><div class="grid"><div><h3>Đơn vị</h3><div id="departmentsArea"></div></div><div><h3>Chức danh</h3><div id="positionsArea"></div></div></div>\n<div id="adminForms" class="hidden"><h3 class="section-title">Thêm đơn vị</h3><form id="departmentForm" class="grid"><div><label>Mã đơn vị</label><input name="code" required maxlength="40"></div><div><label>Tên đơn vị</label><input name="name" required maxlength="200"></div><div style="align-self:end"><button type="submit">Thêm đơn vị</button></div></form>\n<h3 class="section-title">Thêm chức danh</h3><form id="positionForm" class="grid"><div><label>Mã chức danh</label><input name="code" required maxlength="40"></div><div><label>Tên chức danh</label><input name="name" required maxlength="200"></div><div style="align-self:end"><button type="submit">Thêm chức danh</button></div></form>\n<h3 class="section-title">Tạo tài khoản nhân sự theo đơn vị và chức danh</h3><form id="employeeForm"><div class="grid"><div><label>Mã nhân viên</label><input name="employee_code" required maxlength="30"></div><div><label>Họ tên</label><input name="full_name" required maxlength="200"></div><div><label>Email</label><input name="email" type="email" required></div><div><label>Mật khẩu ban đầu (ít nhất 10 ký tự)</label><input name="password" type="password" minlength="10" required autocomplete="new-password"></div><div><label>Đơn vị</label><select name="department_id" id="employeeDepartment" required></select></div><div><label>Chức danh</label><select name="position_id" id="employeePosition" required></select></div><div><label>Quyền</label><select name="role"><option value="user">Nhân viên</option><option value="manager">Quản lý</option><option value="admin">Quản trị viên (owner mới được cấp)</option></select></div></div><div class="actions"><button type="submit">Tạo tài khoản</button></div></form></div></section>\n<section id="view-trash" class="card hidden"><h2>Thùng rác nhiệm vụ</h2><p class="muted">Chỉ quản trị viên được xem và khôi phục nhiệm vụ đã xóa.</p><div id="trashArea"></div></section>\n</section><div id="message" class="hidden notice" role="status"></div></main><footer>CESD · Quản lý công việc & KPI | Hồ sơ thực hiện công việc có nhật ký và quyền truy cập</footer>\n<script>\n\'use strict\';\nconst S={token:sessionStorage.getItem(\'cesd_tools_token\')||\'\',user:null,tasks:[],employees:[],directory:[],departments:[],positions:[]};\nconst $=id=>document.getElementById(id);\nconst esc=s=>String(s??\'\').replace(/[&<>"\']/g,c=>({\'&\':\'&amp;\',\'<\':\'&lt;\',\'>\':\'&gt;\',\'"\':\'&quot;\',"\'":\'&#39;\'}[c]));\nconst labelStatus={not_started:\'Chưa thực hiện\',in_progress:\'Đang thực hiện\',needs_revision:\'Cần sửa\',pending_acceptance:\'Chờ nghiệm thu\',completed:\'Đã hoàn thành\',approved:\'Đã duyệt\',declined:\'Đã từ chối\',overdue:\'Quá hạn\'};\nconst isAdmin=()=>S.user&&[\'admin\',\'owner\'].includes(S.user.role);\nconst person=id=>(S.directory.find(x=>x.id===id)||S.employees.find(x=>x.id===id)||{}).full_name||id;\nconst dept=id=>(S.departments.find(x=>x.id===id)||{}).name||\'Không xác định\';\nfunction showMessage(msg,kind=\'\'){const e=$(\'message\');e.className=\'notice \'+(kind||\'\');e.textContent=msg;e.classList.remove(\'hidden\');window.scrollTo({top:0,behavior:\'smooth\'});}\nasync function api(path,opts={}){\n const headers={...(opts.headers||{}),...(S.token?{Authorization:\'Bearer \'+S.token}:{})};\n if(opts.body&&!(opts.body instanceof FormData)&&typeof opts.body!==\'string\'){headers[\'Content-Type\']=\'application/json\';opts.body=JSON.stringify(opts.body)}\n const r=await fetch(path,{...opts,headers,cache:\'no-store\'});let data;\n try{data=await r.json()}catch{data={detail:\'Lỗi kết nối máy chủ\'}}\n if(!r.ok){if(r.status===401&&path!==\'/auth/login\'){logout();throw Error(\'Phiên đăng nhập hết hạn. Vui lòng đăng nhập lại.\')}throw Error(typeof data.detail===\'string\'?data.detail:\'Yêu cầu không thành công (\'+r.status+\')\')}\n return data;\n}\nfunction logout(){S.token=\'\';S.user=null;sessionStorage.removeItem(\'cesd_tools_token\');$(\'loginPanel\').classList.remove(\'hidden\');$(\'appPanel\').classList.add(\'hidden\');$(\'logout\').classList.add(\'hidden\');$(\'who\').textContent=\'\';}\n$(\'loginForm\').addEventListener(\'submit\',async e=>{e.preventDefault();const f=new FormData(e.currentTarget);try{let x=await api(\'/auth/login\',{method:\'POST\',body:{email:f.get(\'email\'),password:f.get(\'password\')}});S.token=x.access_token;sessionStorage.setItem(\'cesd_tools_token\',S.token);e.currentTarget.reset();await refreshAll();}catch(err){showMessage(err.message,\'err\')}});\nasync function refreshAll(){\n try{\n S.user=await api(\'/auth/me\');\n const results=await Promise.all([api(\'/tasks\'),api(\'/directory\'),api(\'/departments-list\'),api(\'/positions-list\'),api(\'/employees\')]);\n [S.tasks,S.directory,S.departments,S.positions,S.employees]=results;\n $(\'who\').textContent=S.user.full_name+\' (\'+S.user.role+\')\';$(\'loginPanel\').classList.add(\'hidden\');$(\'appPanel\').classList.remove(\'hidden\');$(\'logout\').classList.remove(\'hidden\');\n $(\'adminForms\').classList.toggle(\'hidden\',!isAdmin());$(\'tab-trash\').classList.toggle(\'hidden\',!isAdmin());\n renderTasks();renderPositions();if(isAdmin())await renderTrash();showTab(\'tasks\');\n }catch(e){showMessage(e.message,\'err\')}\n}\nfunction showTab(tab){for(let id of [\'tasks\',\'positions\',\'trash\']){$(\'view-\'+id).classList.toggle(\'hidden\',id!==tab);$(\'tab-\'+id).classList.toggle(\'active\',id===tab)}}\nfunction renderTasks(){\n if(!S.tasks.length){$(\'tasksArea\').innerHTML=\'<p class="muted">Chưa có nhiệm vụ được phân công.</p>\';return}\n $(\'tasksArea\').innerHTML=S.tasks.map(t=>{\n const canDelete=isAdmin()||t.assigner_id===S.user.id;\n const as=t.assignments.map(a=>{\n const mine=a.employee_id===S.user.id;\n const canUpdate=mine&&[\'not_started\',\'in_progress\',\'needs_revision\'].includes(a.status);\n const canResolve=(isAdmin()||t.assigner_id===S.user.id||S.user.role===\'manager\')&&a.status===\'declined\';\n let html=`<div class="assignee"><div class="line"><strong>${esc(person(a.employee_id))}</strong><span class="pill">${esc(labelStatus[a.effective_status]||a.status)}</span><small>Tiến độ: ${Number(a.progress_percent)||0}%</small></div>`;\n if(a.decline_reason)html+=`<p class="notice err">Lý do từ chối: ${esc(a.decline_reason)}</p>`;\n if(canUpdate){html+=`<form onsubmit="submitProgress(event,\'${esc(a.id)}\')"><div class="grid"><div><label>Tiến độ (%)</label><input type="number" name="progress_percent" min="0" max="100" value="${Number(a.progress_percent)||0}" required></div><div><label>File báo cáo (tối đa 5 MB)</label><input type="file" name="file" accept=".pdf,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.txt,.csv,.png,.jpg,.jpeg,.odt,.ods"></div></div><label>Nội dung cập nhật</label><textarea name="note" placeholder="Đã thực hiện, kết quả, khó khăn, kế hoạch tiếp theo..."></textarea><div class="actions"><button type="submit">Lưu tiến độ / Nộp file</button><button type="button" class="warning" onclick="decline(\'${esc(a.id)}\')">Từ chối nhiệm vụ</button></div></form>`}\n if(canResolve){const opts=S.directory.filter(x=>x.id!==a.employee_id).map(x=>`<option value="${esc(x.id)}">${esc(x.full_name)}</option>`).join(\'\');html+=`<div class="actions"><button class="mutebtn" onclick="reopen(\'${esc(a.id)}\')">Mở lại cho người này</button></div><div class="inlineform"><select id="new-${esc(a.id)}"><option value="">-- Chọn nhân sự thay thế --</option>${opts}</select><button onclick="reassign(\'${esc(t.id)}\',\'${esc(a.id)}\')">Giao cho người khác</button></div>`}\n html+=`<details><summary onclick="loadHistory(\'${esc(a.id)}\')">Lịch sử cập nhật tiến độ</summary><div id="history-${esc(a.id)}" class="status">Nhấn để tải...</div></details></div>`;\n return html;\n }).join(\'\');\n return `<div class="task"><div class="line"><h3>${esc(t.title)}</h3><span class="pill">${esc(t.code)}</span></div><p class="muted">${esc(dept(t.department_id))} · Hạn: ${esc(t.due_date)} · Người giao: ${esc(person(t.assigner_id))}</p>${t.content?`<p>${esc(t.content)}</p>`:\'\'}${as}${canDelete?`<div class="actions"><button class="danger" onclick="deleteTask(\'${esc(t.id)}\')">Xóa nhiệm vụ (vào thùng rác)</button></div>`:\'\'}</div>`;\n }).join(\'\');\n}\nasync function submitProgress(e,aid){e.preventDefault();const f=new FormData(e.currentTarget);const file=f.get(\'file\');if(file&&(!file.name||file.size===0))f.delete(\'file\');if(!String(f.get(\'note\')||\'\').trim()&&!f.has(\'file\')){showMessage(\'Hãy nhập nội dung hoặc chọn file báo cáo.\',\'err\');return}if(f.has(\'file\')&&file.size>5*1024*1024){showMessage(\'File vượt quá 5 MB.\',\'err\');return}const b=e.submitter;b.disabled=true;try{await api(\'/assignments/\'+aid+\'/progress-reports\',{method:\'POST\',body:f});showMessage(\'Đã lưu một lần cập nhật mới và file báo cáo (nếu có).\',\'ok\');await refreshAll()}catch(err){showMessage(err.message,\'err\')}finally{b.disabled=false}}\nasync function loadHistory(aid){const h=$(\'history-\'+aid);if(!h)return;h.textContent=\'Đang tải...\';try{let rows=await api(\'/assignments/\'+aid+\'/progress-history\');h.innerHTML=rows.length?rows.map(x=>`<div class="entry"><small>${esc(new Date(x.created_at).toLocaleString(\'vi-VN\'))} · ${esc(x.author_name)}</small><b> · ${x.progress_percent}%</b><p>${esc(x.note)}</p>${x.files.map(f=>`<button class="mutebtn" onclick="downloadProgress(\'${esc(f.id)}\',\'${esc(f.file_name)}\')">↓ ${esc(f.file_name)}</button>`).join(\'\')}</div>`).join(\'\'):\'Chưa có lịch sử tiến độ trước khi nâng cấp.\'}catch(err){h.textContent=err.message}}\nasync function downloadProgress(id,name){try{let r=await fetch(\'/progress-files/\'+encodeURIComponent(id),{headers:{Authorization:\'Bearer \'+S.token}});if(!r.ok)throw Error(\'Không tải được file (\'+r.status+\')\');let url=URL.createObjectURL(await r.blob()),a=document.createElement(\'a\');a.href=url;a.download=name;document.body.append(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),2000)}catch(e){showMessage(e.message,\'err\')}}\nasync function decline(aid){let reason=prompt(\'Nhập lý do từ chối nhiệm vụ (tối thiểu 5 ký tự):\');if(reason===null)return;try{await api(\'/assignments/\'+aid+\'/decline\',{method:\'POST\',body:{reason}});showMessage(\'Đã ghi nhận từ chối và lưu lý do. Người giao việc có thể giao lại.\',\'ok\');await refreshAll()}catch(e){showMessage(e.message,\'err\')}}\nasync function reopen(aid){let reason=prompt(\'Nhập lý do mở lại nhiệm vụ:\');if(reason===null)return;try{await api(\'/assignments/\'+aid+\'/reopen\',{method:\'POST\',body:{reason}});showMessage(\'Đã mở lại nhiệm vụ.\',\'ok\');await refreshAll()}catch(e){showMessage(e.message,\'err\')}}\nasync function reassign(tid,aid){let id=$(\'new-\'+aid).value;if(!id){showMessage(\'Chọn nhân sự thay thế trước.\',\'err\');return}let reason=prompt(\'Nhập lý do giao lại:\');if(reason===null)return;try{await api(\'/tasks/\'+tid+\'/reassign\',{method:\'POST\',body:{declined_assignment_id:aid,new_employee_id:id,reason}});showMessage(\'Đã giao lại nhiệm vụ và lưu lịch sử.\',\'ok\');await refreshAll()}catch(e){showMessage(e.message,\'err\')}}\nasync function deleteTask(tid){if(!confirm(\'Bạn muốn chuyển nhiệm vụ này vào thùng rác? Dữ liệu lịch sử sẽ được giữ lại.\'))return;const reason=prompt(\'Nhập lý do xóa nhiệm vụ:\');if(reason===null)return;try{await api(\'/tasks/\'+tid,{method:\'DELETE\',body:{reason}});showMessage(\'Đã chuyển nhiệm vụ vào thùng rác.\',\'ok\');await refreshAll()}catch(e){showMessage(e.message,\'err\')}}\nasync function renderTrash(){try{let rows=await api(\'/tasks/deleted\');$(\'trashArea\').innerHTML=rows.length?rows.map(x=>`<div class="task"><b>${esc(x.code)} · ${esc(x.title)}</b><p class="muted">${esc(x.reason)} · ${esc(x.deleted_at)}</p><button onclick="restoreTask(\'${esc(x.id)}\')">Khôi phục</button></div>`).join(\'\'):\'<p>Thùng rác trống.</p>\'}catch(e){$(\'trashArea\').textContent=e.message}}\nasync function restoreTask(id){try{await api(\'/tasks/\'+id+\'/restore\',{method:\'POST\'});showMessage(\'Đã khôi phục nhiệm vụ.\',\'ok\');await refreshAll();showTab(\'trash\')}catch(e){showMessage(e.message,\'err\')}}\nfunction renderPositions(){$(\'departmentsArea\').innerHTML=S.departments.map(x=>`<div class="entry"><strong>${esc(x.name)}</strong><br><small>${esc(x.code)}</small></div>`).join(\'\');$(\'positionsArea\').innerHTML=S.positions.map(x=>`<div class="entry"><strong>${esc(x.name)}</strong><br><small>${esc(x.code)}</small></div>`).join(\'\');$(\'employeeDepartment\').innerHTML=S.departments.map(x=>`<option value="${esc(x.id)}">${esc(x.name)}</option>`).join(\'\');$(\'employeePosition\').innerHTML=S.positions.map(x=>`<option value="${esc(x.id)}">${esc(x.name)}</option>`).join(\'\')}\nfor(const [id,path] of [[\'departmentForm\',\'/departments\'],[\'positionForm\',\'/positions\'],[\'employeeForm\',\'/employees\']]){$(id).addEventListener(\'submit\',async e=>{e.preventDefault();const data=Object.fromEntries(new FormData(e.currentTarget).entries());try{await api(path,{method:\'POST\',body:data});e.currentTarget.reset();showMessage(\'Đã cập nhật dữ liệu.\',\'ok\');await refreshAll();showTab(\'positions\')}catch(err){showMessage(err.message,\'err\')}})}\nif(S.token)refreshAll();\n</script></body></html>\n'
+
+@app.get('/cesd-workflow', response_class=HTMLResponse, include_in_schema=False)
+def cesd_workflow():
+    return HTMLResponse(WORKFLOW_PAGE, headers={'Cache-Control': 'no-store'})
