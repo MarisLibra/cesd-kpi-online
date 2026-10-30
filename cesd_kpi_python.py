@@ -5,6 +5,7 @@ Not a literal replacement for PostgreSQL RLS, Supabase Auth, or Storage.
 from __future__ import annotations
 
 import os
+import hashlib
 import secrets
 import uuid
 from datetime import date, datetime, timedelta, timezone
@@ -328,13 +329,81 @@ with SessionLocal() as s:
         s.add_all([Setting(key='annual_min_months', value=1), Setting(key='allow_admin_self_approval', value=False)])
     if s.scalar(select(func.count()).select_from(Rating)) == 0:
         s.add_all([Rating(name=n, min_score=v) for n, v in [('Xuất sắc',90),('Tốt',80),('Hoàn thành',50),('Không hoàn thành',0)]])
-    admin_email, admin_pw = os.getenv('CESD_ADMIN_EMAIL', '').strip().lower(), os.getenv('CESD_ADMIN_PASSWORD', '')
-    if admin_email and admin_pw and not s.scalar(select(Employee.id).where(Employee.role.in_(['admin','owner']))):
-        d = Department(code='BGD', name='Ban Giám đốc') if not s.scalar(select(Department).where(Department.code == 'BGD')) else s.scalar(select(Department).where(Department.code == 'BGD'))
-        p = Position(code='GD', name='Giám đốc') if not s.scalar(select(Position).where(Position.code == 'GD')) else s.scalar(select(Position).where(Position.code == 'GD'))
-        s.add_all([d, p]); s.flush()
-        s.add(Employee(employee_code='NV001', full_name='Quản trị CESD', email=admin_email,
-                       password_hash=ph.hash(admin_pw), department_id=d.id, position_id=p.id, role='owner'))
+    # CESD_ADMIN_EMAIL / CESD_ADMIN_PASSWORD: chỉ tạo tài khoản khi chưa có quản trị.
+    # KHÔNG tự ghi đè mật khẩu mỗi lần Render khởi động, vì người dùng có thể đã đổi
+    # mật khẩu trong ứng dụng. Khôi phục một lần bằng CESD_ADMIN_RESET_ID (xem dưới).
+    admin_email = os.getenv('CESD_ADMIN_EMAIL', '').strip().lower()
+    admin_pw = os.getenv('CESD_ADMIN_PASSWORD', '')
+    reset_id = os.getenv('CESD_ADMIN_RESET_ID', '').strip()
+
+    owner = s.scalar(select(Employee).where(Employee.role == 'owner'))
+    any_admin = s.scalar(select(Employee.id).where(Employee.role.in_(['admin', 'owner'])))
+
+    if admin_email and admin_pw and not any_admin:
+        d = s.scalar(select(Department).where(Department.code == 'BGD'))
+        p = s.scalar(select(Position).where(Position.code == 'GD'))
+        if d is None:
+            d = Department(code='BGD', name='Ban Giám đốc')
+            s.add(d)
+        if p is None:
+            p = Position(code='GD', name='Giám đốc')
+            s.add(p)
+        s.flush()
+        owner = Employee(
+            employee_code='NV001', full_name='Quản trị CESD',
+            email=admin_email, password_hash=ph.hash(admin_pw),
+            department_id=d.id, position_id=p.id, role='owner',
+        )
+        s.add(owner)
+        s.flush()
+
+    # Khôi phục có chủ đích, đúng MỘT LẦN cho mỗi mã reset.
+    # Chỉ người quản trị Render (có quyền sửa environment) mới có thể kích hoạt.
+    # Không xóa hay tạo lại tài khoản: giữ nguyên employee ID và liên kết KPI.
+    # Thay đổi CESD_ADMIN_PASSWORD đơn thuần KHÔNG kích hoạt reset.
+    if reset_id:
+        if len(reset_id) < 12:
+            raise RuntimeError('CESD_ADMIN_RESET_ID phải có ít nhất 12 ký tự.')
+        if not admin_email or len(admin_pw) < 12:
+            raise RuntimeError('Khi khôi phục, cần CESD_ADMIN_EMAIL và CESD_ADMIN_PASSWORD (ít nhất 12 ký tự).')
+
+        reset_fingerprint = hashlib.sha256(reset_id.encode('utf-8')).hexdigest()
+        marker = s.get(Setting, 'owner_password_reset_fingerprint')
+        if marker is None or marker.value != reset_fingerprint:
+            if owner is None:
+                raise RuntimeError('Không tìm thấy owner để khôi phục; cần kiểm tra tài khoản quản trị hiện có.')
+
+            email_user = s.scalar(select(Employee).where(Employee.email == admin_email))
+            if email_user is not None and email_user.id != owner.id:
+                raise RuntimeError(
+                    'Email CESD_ADMIN_EMAIL đang được dùng bởi tài khoản khác. '
+                    'Không đổi chủ sở hữu tự động để tránh mất quyền hoặc sai dữ liệu.'
+                )
+
+            previous_email = owner.email
+            owner.email = admin_email
+            owner.password_hash = ph.hash(admin_pw)
+            owner.status = 'active'
+
+            sec = s.get(AccountSecurity, owner.id)
+            if sec is None:
+                sec = AccountSecurity(employee_id=owner.id, token_version=0)
+                s.add(sec)
+            sec.token_version += 1   # Thu hồi token đăng nhập cũ
+            sec.failed_logins = 0    # Mở khóa sau khi khôi phục
+            sec.locked_until = None
+
+            s.add(AuditLog(
+                table_name='employees', record_id=owner.id,
+                action='owner_recovery_via_render',
+                actor_id=None,
+                details={'previous_email': previous_email, 'new_email': admin_email},
+            ))
+            if marker is None:
+                s.add(Setting(key='owner_password_reset_fingerprint', value=reset_fingerprint))
+            else:
+                marker.value = reset_fingerprint
+            print('CESD: owner recovery applied once; existing employee and KPI data preserved.')
     s.commit()
 
 
